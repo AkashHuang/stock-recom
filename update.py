@@ -115,8 +115,8 @@ def is_trading_day(tz="Asia/Shanghai"):
     return True
 
 
-def http_get(url, timeout=25, tries=4, binary=False):
-    """带重试的 GET; 失败抛异常。"""
+def http_get(url, timeout=25, tries=4, binary=False, encoding="utf-8"):
+    """带重试的 GET; 失败抛异常。encoding 用于文本解码（如腾讯行情用 gb18030）。"""
     last = None
     for _ in range(tries):
         try:
@@ -127,7 +127,7 @@ def http_get(url, timeout=25, tries=4, binary=False):
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 data = r.read()
-                return data if binary else data.decode("utf-8", "replace")
+                return data if binary else data.decode(encoding, "replace")
         except Exception as e:
             last = e
             time.sleep(1.5)
@@ -152,7 +152,7 @@ def fetch_quotes_tencent(codes):
         batch = [code_to_secid(c) for c in codes[i:i + 80]]
         url = "https://qt.gtimg.cn/q=" + ",".join(batch)
         try:
-            txt = http_get(url)
+            txt = http_get(url, encoding="gb18030")
         except Exception as e:
             print(f"[warn] 行情批量拉取失败: {e}")
             continue
@@ -438,7 +438,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   *{box-sizing:border-box;}
   body{margin:0;background:var(--bg);color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Heiti SC","STHeiti","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
     font-size:14px;line-height:1.5;}
   header{padding:18px 22px 10px;border-bottom:1px solid var(--border);}
   h1{margin:0 0 6px;font-size:20px;font-weight:600;letter-spacing:.5px;}
@@ -620,23 +620,32 @@ window.SNAPSHOT = __SNAPSHOT__;
     const hist=macd.hist.map(v=>({value:v,itemStyle:{color:v>=0?UP:DOWN}}));
     const option={
       backgroundColor:'transparent', animation:false,
-      legend:{data:['MA5','MA20','DIF','DEA'],top:2,textStyle:{color:'#c9d1d9'},itemWidth:14,itemHeight:8},
+      title:[
+        {text:'周线 K 线',left:56,top:10,textStyle:{fontSize:12,color:'#8b949e',fontWeight:'normal'}},
+        {text:'成交量',left:56,top:'58%',textStyle:{fontSize:12,color:'#8b949e',fontWeight:'normal'}},
+        {text:'MACD',left:56,top:'77%',textStyle:{fontSize:12,color:'#8b949e',fontWeight:'normal'}}
+      ],
+      legend:{data:['MA5','MA20','DIF','DEA'],top:10,right:18,textStyle:{color:'#c9d1d9',fontSize:11},itemWidth:14,itemHeight:8},
       tooltip:{trigger:'axis',axisPointer:{type:'cross'},backgroundColor:'#161b22',borderColor:'#30363d',textStyle:{color:'#c9d1d9'}},
       axisPointer:{link:[{xAxisIndex:'all'}]},
       grid:[
-        {left:56,right:18,top:34,height:'46%'},
-        {left:56,right:18,top:'62%',height:'15%'},
-        {left:56,right:18,top:'81%',height:'15%'}
+        {left:56,right:62,top:36,height:'44%'},
+        {left:56,right:62,top:'61%',height:'14%'},
+        {left:56,right:62,top:'80%',height:'14%'}
       ],
       xAxis:[
         {type:'category',data:dates,gridIndex:0,axisLabel:{show:false},axisLine:{lineStyle:{color:'#30363d'}}},
         {type:'category',data:dates,gridIndex:1,axisLabel:{show:false},axisLine:{lineStyle:{color:'#30363d'}}},
-        {type:'category',data:dates,gridIndex:2,axisLine:{lineStyle:{color:'#30363d'}},axisLabel:{color:'#8b949e',fontSize:11}}
+        {type:'category',data:dates,gridIndex:2,axisLine:{lineStyle:{color:'#30363d'}},axisLabel:{color:'#8b949e',fontSize:10}}
       ],
       yAxis:[
-        {scale:true,gridIndex:0,splitLine:{lineStyle:{color:'#21262d'}},axisLabel:{color:'#8b949e'}},
-        {scale:true,gridIndex:1,splitLine:{show:false},axisLabel:{color:'#8b949e'}},
-        {scale:true,gridIndex:2,splitLine:{show:false},axisLabel:{color:'#8b949e'}}
+        {scale:true,gridIndex:0,splitLine:{lineStyle:{color:'#21262d'}},axisLabel:{color:'#8b949e',fontSize:10,formatter:v=>v.toFixed(2)}},
+        {scale:true,gridIndex:1,splitLine:{show:false},axisLabel:{color:'#8b949e',fontSize:10,formatter:v=>{
+          if(Math.abs(v)>=1e8) return (v/1e8).toFixed(1)+'亿';
+          if(Math.abs(v)>=1e4) return (v/1e4).toFixed(0)+'万';
+          return v>=1000?(v/1e4).toFixed(1)+'万':v;
+        }}},
+        {scale:true,gridIndex:2,splitLine:{show:false},axisLabel:{color:'#8b949e',fontSize:10,formatter:v=>v.toFixed(2)}}
       ],
       dataZoom:[
         {type:'inside',xAxisIndex:[0,1,2],start:55,end:100},
