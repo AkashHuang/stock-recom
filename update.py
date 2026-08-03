@@ -9,12 +9,15 @@ A股周线金叉选股 —— 数据拉取 + 指标计算 + 静态页面渲染
   - 周线金叉: 当前 MA5 > MA20
   - 每板块 Top10: 主排序=近4周涨幅(动量), 次排序=金叉强度(MA5离MA20幅度)
   - 默认排除 ST、排除北交所 (可在 config 开关)
-  - 数据源 AkShare; 境外 Actions 环境加重试/超时/限频
+  - 数据源: 腾讯财经(qt.gtimg.cn 行情 + web.ifzq.gtimg.cn 周线)。该源在境外 GitHub Actions 可达;
+    Eastmoney 在境外被墙, 故板块成分(baked codes)写在 config.json, 可用 `python update.py --resolve`
+    在 Eastmoney 可达的环境(如本机)刷新为精确成分。
 
 用法:
-  python update.py            # 真实拉数
+  python update.py            # 真实拉数(Tencent)
   python update.py --mock     # 生成本地预览用的合成数据(无需联网)
-  MOCK=1 python update.py     # 同上
+  python update.py --resolve  # 从 Eastmoney 刷新各板块成分写回 config.json(需 Eastmoney 可达)
+  MOCK=1 python update.py     # 同上(合成数据)
 """
 
 import os
@@ -24,6 +27,8 @@ import time
 import math
 import random
 import datetime as dt
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -88,50 +93,127 @@ def compute_indicators(close: pd.Series, vol: pd.Series, fast=5, slow=20):
 # 真实数据拉取 (AkShare)
 # ----------------------------------------------------------------------------
 def is_trading_day(tz="Asia/Shanghai"):
-    """判断今天(北京时间)是否为交易日; 非交易日返回 False -> 跳过更新。"""
-    try:
-        import akshare as ak
-        cal = ak.tool_trade_date_hist_sina()
-        trade_dates = set(pd.to_datetime(cal["trade_date"]).dt.date)
-        today = dt.datetime.now(dt.timezone.utc).astimezone(
-            dt.timezone(dt.timedelta(hours=8))
-        ).date()
-        return today in trade_dates
-    except Exception as e:  # 拉不到日历则保守地继续(不阻断)
-        print(f"[warn] 交易日历获取失败, 继续执行: {e}")
-        return True
+    """判断今天(北京时间)是否为交易日; 非交易日返回 False -> 跳过更新。
+    简化实现: 跳过周末 + 2026 年大陆法定节假日静态表(无需联网)。"""
+    today = dt.datetime.now(dt.timezone.utc).astimezone(
+        dt.timezone(dt.timedelta(hours=8))
+    ).date()
+    if today.weekday() >= 5:  # 周六/周日
+        return False
+    holidays_2026 = {
+        dt.date(2026, 1, 1), dt.date(2026, 1, 2),
+        dt.date(2026, 2, 16), dt.date(2026, 2, 17), dt.date(2026, 2, 18),
+        dt.date(2026, 4, 3), dt.date(2026, 4, 4), dt.date(2026, 4, 5), dt.date(2026, 4, 6),
+        dt.date(2026, 5, 1), dt.date(2026, 5, 2), dt.date(2026, 5, 3),
+        dt.date(2026, 6, 19), dt.date(2026, 6, 20), dt.date(2026, 6, 21),
+        dt.date(2026, 9, 25), dt.date(2026, 9, 26), dt.date(2026, 9, 27),
+        dt.date(2026, 10, 1), dt.date(2026, 10, 2), dt.date(2026, 10, 3),
+        dt.date(2026, 10, 4), dt.date(2026, 10, 5), dt.date(2026, 10, 6), dt.date(2026, 10, 7),
+    }
+    if today in holidays_2026:
+        return False
+    return True
 
 
-def fetch_board(spec):
-    import akshare as ak
-    if spec["type"] == "concept":
-        df = ak.stock_board_concept_cons_em(symbol=spec["ak_name"])
-    else:
-        df = ak.stock_board_industry_cons_em(symbol=spec["ak_name"])
-    return df
-
-
-def fetch_weekly(code, start, end):
-    import akshare as ak
-    last_err = None
-    for attempt in range(3):
+def http_get(url, timeout=25, tries=4, binary=False):
+    """带重试的 GET; 失败抛异常。"""
+    last = None
+    for _ in range(tries):
         try:
-            df = ak.stock_zh_a_hist(
-                symbol=code, period="weekly",
-                start_date=start, end_date=end, adjust="qfq",
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"},
             )
-            if df is not None and not df.empty:
-                return df
-            last_err = "empty"
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+                return data if binary else data.decode("utf-8", "replace")
         except Exception as e:
-            last_err = e
-            time.sleep(1.5 * (attempt + 1))
-    print(f"[warn] {code} 周线拉取失败: {last_err}")
-    return None
+            last = e
+            time.sleep(1.5)
+    raise last
+
+
+def code_to_secid(code):
+    """纯数字代码 -> 腾讯 secid 前缀 (sh/sz/bj)。"""
+    if code.startswith("6"):
+        return "sh" + code
+    if code.startswith(("0", "3")):
+        return "sz" + code
+    if code.startswith(("4", "8")):
+        return "bj" + code
+    return "sh" + code
+
+
+def fetch_quotes_tencent(codes):
+    """批量拉腾讯实时行情: 现价(字段3) + 市盈率TTM(字段39)。返回 {plain_code:{name,price,pe}}。"""
+    out = {}
+    for i in range(0, len(codes), 80):
+        batch = [code_to_secid(c) for c in codes[i:i + 80]]
+        url = "https://qt.gtimg.cn/q=" + ",".join(batch)
+        try:
+            txt = http_get(url)
+        except Exception as e:
+            print(f"[warn] 行情批量拉取失败: {e}")
+            continue
+        for line in txt.replace("\r", "").split("\n"):
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            var, val = line.split("=", 1)
+            val = val.strip()
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            if not val:
+                continue
+            f = val.split("~")
+            if len(f) < 40:
+                continue
+            secid = var.replace("v_", "").strip()
+            plain = secid[2:] if secid[:2] in ("sh", "sz", "bj") else secid
+            name = f[1]
+            try:
+                price = float(f[3])
+            except Exception:
+                price = None
+            try:
+                pe = float(f[39]) if f[39] not in ("", "-") else None
+            except Exception:
+                pe = None
+            out[plain] = {"name": name, "price": price, "pe": pe}
+    return out
+
+
+def fetch_weekly_tencent(secid):
+    """腾讯周线(前复权): 返回 {dates,open,close,high,low,vol}; 顺序 [date,open,close,high,low,volume]。"""
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={secid},week,,,60,qfq"
+    try:
+        txt = http_get(url)
+        d = json.loads(txt)
+    except Exception as e:
+        print(f"[warn] {secid} 周线失败: {e}")
+        return None
+    data = d.get("data", {}) or {}
+    node = data.get(secid) if secid in data else (list(data.values())[0] if data else None)
+    if not node:
+        return None
+    arr = node.get("qfqweek") or node.get("week") or []
+    res = {"dates": [], "open": [], "close": [], "high": [], "low": [], "vol": []}
+    for row in arr:
+        if len(row) < 6:
+            continue
+        res["dates"].append(row[0])
+        res["open"].append(float(row[1]))
+        res["close"].append(float(row[2]))
+        res["high"].append(float(row[3]))
+        res["low"].append(float(row[4]))
+        res["vol"].append(float(row[5]))
+    if not res["close"]:
+        return None
+    return res
 
 
 def run_real(cfg):
-    import akshare as ak
     sc = cfg["screener"]
     price_max = float(sc["price_max"])
     exclude_st = bool(sc["exclude_st"])
@@ -140,96 +222,69 @@ def run_real(cfg):
     fast, slow = int(sc["sma_fast"]), int(sc["sma_slow"])
     weeks = int(sc["weeks_history"])
 
-    today = dt.datetime.now(dt.timezone.utc).astimezone(
-        dt.timezone(dt.timedelta(hours=8))
-    )
-    end = today.strftime("%Y%m%d")
-    start = (today - dt.timedelta(days=weeks * 7 + 30)).strftime("%Y%m%d")
-
     sectors_out = []
     for spec in cfg["sectors"]:
-        print(f"[info] 板块: {spec['name']} ({spec['type']}/{spec['ak_name']})")
-        try:
-            board = fetch_board(spec)
-        except Exception as e:
-            print(f"[warn] 板块 {spec['name']} 成分获取失败: {e}")
+        codes = spec.get("codes") or []
+        print(f"[info] 板块: {spec['name']} (baked {len(codes)} 只)")
+        if not codes:
             sectors_out.append({"name": spec["name"], "type": spec["type"],
                                 "matched": 0, "stocks": []})
             continue
 
-        # 列名兼容
-        code_col = "代码" if "代码" in board.columns else board.columns[1]
-        name_col = "名称" if "名称" in board.columns else board.columns[2]
-        price_col = "最新价" if "最新价" in board.columns else None
-        pe_col = "市盈率-动态" if "市盈率-动态" in board.columns else None
-
+        quotes = fetch_quotes_tencent(codes)
         candidates = []
-        for _, row in board.iterrows():
-            code = str(row[code_col]).strip()
-            name = str(row[name_col]).strip()
-            if exclude_st and ("ST" in name.upper() or name.upper().startswith("S")):
+        for code in codes:
+            q = quotes.get(code)
+            if not q:
+                continue
+            name = q["name"]
+            price = q["price"]
+            if exclude_st and "ST" in name.upper():
                 continue
             if exclude_bse and (code.startswith("8") or code.startswith("4")):
                 continue
-            try:
-                price = float(row[price_col]) if price_col else float("nan")
-            except Exception:
-                price = float("nan")
-            if math.isnan(price) or price >= price_max or price <= 0:
+            if price is None or price >= price_max or price <= 0:
                 continue
-            candidates.append((code, name, price))
+            candidates.append((code, name, price, q["pe"]))
+        print(f"[info]  候选(现价<{price_max}, 排除ST/北交所): {len(candidates)} 只")
 
-        print(f"[info]  候选(价<{price_max}, 排除ST/北交所后): {len(candidates)} 只")
-
-        stocks = []
-        for code, name, price in candidates:
-            wk = fetch_weekly(code, start, end)
-            time.sleep(0.12)
-            if wk is None:
-                continue
-            try:
-                pe_raw = None
-                if pe_col and pe_col in wk.columns:
-                    pe_raw = wk[pe_col].iloc[-1]
-            except Exception:
-                pe_raw = None
-            # PE 取成分表字段更稳, 这里从 board 行取
-            pe = parse_pe(row.get(pe_col) if pe_col else None)
-
-            close = wk["收盘"]
-            vol = wk["成交量"]
-            ind = compute_indicators(close, vol, fast, slow)
+        def worker(cand):
+            code, name, price, pe = cand
+            kl = fetch_weekly_tencent(code_to_secid(code))
+            if not kl or len(kl["close"]) < slow:
+                return None
+            ind = compute_indicators(pd.Series(kl["close"]), pd.Series(kl["vol"]), fast, slow)
             if not ind["golden"]:
-                continue
-
-            ohlc = []
-            for _, r in wk.iterrows():
-                o = float(r["开盘"]); c = float(r["收盘"])
-                l = float(r["最低"]); h = float(r["最高"])
-                ohlc.append([round(o, 3), round(c, 3), round(l, 3), round(h, 3)])
-
-            stocks.append({
-                "code": code, "name": name, "price": round(price, 3),
-                "pe": pe,
+                return None
+            n = len(kl["close"])
+            ohlc = [[round(kl["open"][i], 3), round(kl["close"][i], 3),
+                     round(kl["low"][i], 3), round(kl["high"][i], 3)] for i in range(n)]
+            return {
+                "code": code, "name": name, "price": round(price, 3), "pe": pe,
                 "momentum_4w": ind["momentum_4w"],
                 "golden_strength": ind["golden_strength"],
                 "volume": ind["last_volume"],
                 "signal": "金叉",
                 "kline": {
-                    "dates": [str(d)[:10] for d in wk["日期"].tolist()],
-                    "ohlc": ohlc,
+                    "dates": kl["dates"], "ohlc": ohlc,
                     "ma5": ind["ma5"], "ma20": ind["ma20"],
-                    "volume": [int(v) for v in vol.tolist()],
+                    "volume": [int(v) for v in kl["vol"]],
                     "macd": ind["macd"],
                 },
-            })
+            }
 
-        # 排序: 主=动量(降), 次=金叉强度(降); NaN 动量排末尾
+        stocks = []
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(worker, c) for c in candidates]
+            for f in as_completed(futs):
+                r = f.result()
+                if r:
+                    stocks.append(r)
+
         def sort_key(s):
             m = s["momentum_4w"]
-            return (0 if (m is not None and not math.isnan(m)) else 1,
-                    -(m if (m is not None and not math.isnan(m)) else 0),
-                    -s["golden_strength"])
+            ok = (m is not None and not (isinstance(m, float) and math.isnan(m)))
+            return (0 if ok else 1, -(m if ok else 0), -s["golden_strength"])
         stocks.sort(key=sort_key)
         top = stocks[:top_n]
         for i, s in enumerate(top, 1):
@@ -242,6 +297,28 @@ def run_real(cfg):
         print(f"[info]  金叉命中 {len(stocks)} 只, 展示 Top{len(top)}")
 
     return sectors_out
+
+
+def resolve_constituents(cfg):
+    """从 Eastmoney(push2) 拉取每个板块成分写回 config.json 的 codes 字段。
+    仅在本机 Eastmoney 可达时运行(如用户本地/中国网络); GitHub Actions 上 Eastmoney 被墙, 用 baked codes。"""
+    print("[info] --resolve: 尝试从 Eastmoney 刷新板块成分...")
+    for spec in cfg["sectors"]:
+        bk = spec.get("bk")
+        if not bk:
+            print(f"[warn] {spec['name']} 无 bk 字段, 跳过")
+            continue
+        url = f"https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=2000&po=1&np=1&fltt=2&invt=2&fid=f3&fs=b:{bk}&fields=f12,f14"
+        try:
+            d = json.loads(http_get(url))
+            diff = d["data"]["diff"]
+            spec["codes"] = [x["f12"] for x in diff]
+            print(f"[info] {spec['name']}: {len(spec['codes'])} 只")
+        except Exception as e:
+            print(f"[warn] {spec['name']} 解析失败(可能 Eastmoney 不可达): {e}")
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    print("[done] 已写回 config.json 的 codes 字段")
 
 
 def parse_pe(val):
@@ -413,7 +490,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 <header>
   <h1>A股周线金叉选股</h1>
-  <div class="meta">更新时间：<span id="updated"></span> · 数据源 AkShare · 仅供研究，非投资建议</div>
+  <div class="meta">更新时间：<span id="updated"></span> · 数据源 腾讯财经 · 仅供研究，非投资建议</div>
   <div class="config-tags" id="configTags"></div>
 </header>
 <nav class="sector-tabs" id="sectorTabs"></nav>
@@ -610,6 +687,9 @@ def render_html(snapshot):
 
 def main():
     cfg = load_config()
+    if "--resolve" in sys.argv:
+        resolve_constituents(cfg)
+        return
     mock = ("--mock" in sys.argv) or (os.environ.get("MOCK") == "1")
 
     if not mock:
@@ -620,6 +700,13 @@ def main():
     print(f"[info] 模式: {'MOCK' if mock else 'REAL'}")
     sectors = run_mock(cfg) if mock else run_real(cfg)
     snapshot = build_snapshot(sectors, cfg)
+
+    # 安全护栏: REAL 模式下若全部板块 0 命中(多为网络被墙/超时), 不覆盖已有页面, 避免发布空白页。
+    if not mock:
+        total_matched = sum(s.get("matched", 0) for s in sectors)
+        if total_matched == 0:
+            print("[warn] REAL 模式全部板块 0 命中，疑似数据源不可达；保留上次页面，不覆盖。")
+            sys.exit(0)
 
     os.makedirs(os.path.dirname(SNAPSHOT_PATH), exist_ok=True)
     with open(SNAPSHOT_PATH, "w", encoding="utf-8") as f:
