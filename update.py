@@ -105,9 +105,9 @@ def is_trading_day(tz="Asia/Shanghai"):
 def fetch_board(spec):
     import akshare as ak
     if spec["type"] == "concept":
-        df = ak.stock_board_concept_name_em(symbol=spec["ak_name"])
+        df = ak.stock_board_concept_cons_em(symbol=spec["ak_name"])
     else:
-        df = ak.stock_board_industry_name_em(symbol=spec["ak_name"])
+        df = ak.stock_board_industry_cons_em(symbol=spec["ak_name"])
     return df
 
 
@@ -167,7 +167,7 @@ def run_real(cfg):
         for _, row in board.iterrows():
             code = str(row[code_col]).strip()
             name = str(row[name_col]).strip()
-            if exclude_st and ("ST" in name.upper() or name.startswith("S") and name.upper() != "S"):
+            if exclude_st and ("ST" in name.upper() or name.upper().startswith("S")):
                 continue
             if exclude_bse and (code.startswith("8") or code.startswith("4")):
                 continue
