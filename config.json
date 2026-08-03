@@ -1,0 +1,24 @@
+{
+  "screener": {
+    "price_max": 10.0,
+    "exclude_st": true,
+    "exclude_bse": true,
+    "top_n": 10,
+    "sma_fast": 5,
+    "sma_slow": 20,
+    "weeks_history": 60,
+    "sort_primary": "momentum_4w",
+    "sort_secondary": "golden_strength",
+    "golden_cross_rule": "ma5_gt_ma20",
+    "timezone": "Asia/Shanghai"
+  },
+  "sectors": [
+    {"name": "证券",     "type": "industry", "ak_name": "证券"},
+    {"name": "电力",     "type": "industry", "ak_name": "电力"},
+    {"name": "电网",     "type": "industry", "ak_name": "电网设备"},
+    {"name": "医药",     "type": "concept",  "ak_name": "医药"},
+    {"name": "广告营销", "type": "industry", "ak_name": "广告营销"},
+    {"name": "化工",     "type": "industry", "ak_name": "化学制品"},
+    {"name": "锂电池",   "type": "concept",  "ak_name": "锂电池"}
+  ]
+}
